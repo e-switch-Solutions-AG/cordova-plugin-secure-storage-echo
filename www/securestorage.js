@@ -107,6 +107,14 @@ SecureStorage.prototype = {
         } catch (e) {
             error(e);
         }
+    },
+    
+    auth: function (success, error) {
+        try {
+            _executeNativeMethod(success, error, 'auth', [this.service]);
+        } catch (e) {
+            error(e);
+        }
     }
 };
 
