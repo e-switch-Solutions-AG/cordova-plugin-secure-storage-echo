@@ -1,8 +1,11 @@
 # SecureStorage plugin for Apache Cordova
 
-[![NPM](https://nodei.co/npm/cordova-plugin-secure-storage-echo.png?mini=true)](https://nodei.co/npm/cordova-plugin-secure-storage-echo/)
+##### Forked from [mibrito707/cordova-plugin-secure-storage](https://github.com/mibrito707/cordova-plugin-secure-storage) in a effort to keep that project alive. Thank you @mibrito707.
 
-##### Forked from [Crypho/cordova-plugin-secure-storage](https://github.com/Crypho/cordova-plugin-secure-storage) in a effort to keep that project alive. Thank you @ggozad.
+### Changes ###
+
+- Supports [BiometricPrompt](https://github.com/mibrito707/cordova-plugin-secure-storage-echo/pull/21)
+- implement `auth` action to [Show Confirm Credentials screen / Authentication popup](#auth)
 
 ## Introduction
 
@@ -116,6 +119,20 @@ ss.keys(
 ss.clear(
   function() {
     console.log("Cleared");
+  },
+  function(error) {
+    console.log("Error, " + error);
+  }
+);
+```
+
+#### <a name="auth"></a>Show Confirm Credentials screen / Authentication popup
+_(Android only)_
+
+```js
+ss.auth(
+  function() {
+    console.log("Success");
   },
   function(error) {
     console.log("Error, " + error);
