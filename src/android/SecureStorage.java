@@ -8,6 +8,10 @@ import android.os.Build;
 import android.provider.Settings;
 import android.util.Base64;
 import android.util.Log;
+import android.hardware.biometrics.*;
+import android.os.CancellationSignal;
+import android.os.Handler;
+import android.security.keystore.UserNotAuthenticatedException;
 
 import org.apache.cordova.CallbackContext;
 import org.apache.cordova.CordovaArgs;
@@ -19,11 +23,13 @@ import org.json.JSONObject;
 import java.lang.reflect.Method;
 import java.util.Hashtable;
 import java.util.Map;
+import java.util.concurrent.Executor;
 
 public class SecureStorage extends CordovaPlugin {
     private static final String TAG = "SecureStorage";
 
     private static final boolean SUPPORTED = Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT;
+    private static final Boolean IS_API_29_AVAILABLE = Build.VERSION.SDK_INT >= Build.VERSION_CODES.M;
     private static final Integer DEFAULT_AUTHENTICATION_VALIDITY_TIME = 60 * 60 * 24; // Fallback to 24h. Workaround to avoid asking for credentials too "often"
 
     private static final String MSG_NOT_SUPPORTED = "API 19 (Android 4.4 KitKat) is required. This device is running API " + Build.VERSION.SDK_INT;
@@ -37,6 +43,8 @@ public class SecureStorage extends CordovaPlugin {
     private volatile boolean generateKeysContextRunning = false;
 
     private AbstractRSA rsa = RSAFactory.getRSA();
+    
+    private volatile JSONObject options;
 
     @Override
     public void onResume(boolean multitasking) {
@@ -57,7 +65,15 @@ public class SecureStorage extends CordovaPlugin {
                         if (unlockCredentialsContext != null) {
                             String alias = service2alias(INIT_SERVICE);
                             if (rsa.userAuthenticationRequired(alias)) {
-                                unlockCredentialsContext.error("User not authenticated");
+                                 Log.d(TAG, "onResume - User not authenticated");
+                                unlockCredentialsContext.error("onResume - User not authenticated");
+                                
+                               try {
+                                  execute("auth", (CordovaArgs)null, unlockCredentialsContext);
+                               } catch (JSONException e) {
+                                    Log.e(TAG, "execute failed :", e);
+                                    unlockCredentialsContext.error(e.getMessage());
+                               }
                             }
                             unlockCredentialsContext.success();
                             unlockCredentialsContext = null;
@@ -77,7 +93,7 @@ public class SecureStorage extends CordovaPlugin {
         }
         if ("init".equals(action)) {
             String service = args.getString(0);
-            JSONObject options = args.getJSONObject(1);
+            options = args.getJSONObject(1);
 
             String packageName = options.optString("packageName", getContext().getPackageName());
 
@@ -106,12 +122,15 @@ public class SecureStorage extends CordovaPlugin {
             } else if (!rsa.encryptionKeysAvailable(alias)) {
                 // Encryption Keys aren't available, proceed to generate them
                 Integer userAuthenticationValidityDuration = options.optInt("userAuthenticationValidityDuration", DEFAULT_AUTHENTICATION_VALIDITY_TIME);
+                Log.i(TAG, "set userAuthenticationValidityDuration to " + userAuthenticationValidityDuration);
                 generateKeysContext = callbackContext;
                 generateEncryptionKeys(userAuthenticationValidityDuration);
                 if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.KITKAT) {
                     unlockCredentialsLegacy();
                 }
             } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP && rsa.userAuthenticationRequired(alias)) {
+                Log.d(TAG, "userAuthenticationRequired");
+                
                 // User has to confirm authentication via device credentials.
                 String title = options.optString("unlockCredentialsTitle", null);
                 String description = options.optString("unlockCredentialsDescription", null);
@@ -138,6 +157,9 @@ public class SecureStorage extends CordovaPlugin {
                         result.put("key", Base64.encodeToString(aes_key_enc, Base64.DEFAULT));
                         getStorage(service).store(key, result.toString());
                         callbackContext.success(key);
+                    } catch (UserNotAuthenticatedException e) {
+                            Log.e(TAG, "Encrypt failed - UserNotAuthenticatedException :", e);
+                            callbackContext.error("UserNotAuthenticatedException: " + e.getMessage());
                     } catch (Exception e) {
                         Log.e(TAG, "Encrypt failed :", e);
                         callbackContext.error(e.getMessage());
@@ -163,6 +185,9 @@ public class SecureStorage extends CordovaPlugin {
                             byte[] decryptedKey = rsa.decrypt(encKey, service2alias(service));
                             String decrypted = new String(AES.decrypt(ct, decryptedKey, iv, adata, data.getString("mode")));
                             callbackContext.success(decrypted);
+                        } catch (UserNotAuthenticatedException e) {
+                            Log.e(TAG, "Decrypt failed - UserNotAuthenticatedException :", e);
+                            callbackContext.error("UserNotAuthenticatedException: " + e.getMessage());
                         } catch (Exception e) {
                             Log.e(TAG, "Decrypt failed :", e);
                             callbackContext.error(e.getMessage());
@@ -197,6 +222,17 @@ public class SecureStorage extends CordovaPlugin {
             String service = args.getString(0);
             getStorage(service).clear();
             callbackContext.success();
+            return true;
+        }
+        if ("auth".equals(action)) {
+            Log.d(TAG, "auth action");
+            // User has to confirm authentication via device credentials.
+             String title = options.optString("unlockCredentialsTitle", null);
+             String description = options.optString("unlockCredentialsDescription", null);
+
+             unlockCredentialsContext = callbackContext;
+             unlockCredentials(title, description);
+                
             return true;
         }
         return false;
@@ -236,15 +272,63 @@ public class SecureStorage extends CordovaPlugin {
      */
     @TargetApi(Build.VERSION_CODES.LOLLIPOP)
     private void unlockCredentials(final String title, final String description) {
+        Log.d(TAG, "unlockCredentials");
         cordova.getActivity().runOnUiThread(new Runnable() {
             public void run() {
-                KeyguardManager keyguardManager = (KeyguardManager) (getContext().getSystemService(Context.KEYGUARD_SERVICE));
-                Intent intent = keyguardManager.createConfirmDeviceCredentialIntent(title, description);
-                if (intent != null) {
-                    startActivity(intent);
+                Log.d(TAG, "unlockCredentials - run");
+                if (IS_API_29_AVAILABLE && isDeviceSecure()) {
+                    Log.d(TAG, "BiometricPrompt");
+                    // Building a biometric prompt instance with custom title and description.
+                    BiometricPrompt.Builder biometricPromptBuilder = new BiometricPrompt.Builder(getContext());
+                    if(title != null)
+                       biometricPromptBuilder.setTitle(title);
+                    if(description != null)
+                       biometricPromptBuilder.setDescription(description);
+                    biometricPromptBuilder.setDeviceCredentialAllowed(true);
+                    BiometricPrompt biometricPrompt = biometricPromptBuilder.build();
+                    CancellationSignal cancellationSignal = new CancellationSignal();
+                    Executor executor = getExecutor();
+                    // Launching the credential confirmation popup to get biometric validaiton.
+                    // If biometric is not available will open the other unlock methods.  
+                    biometricPrompt.authenticate(cancellationSignal, executor, new BiometricPrompt.AuthenticationCallback() {
+                        @Override
+                        public void onAuthenticationError(int errorCode, CharSequence errString) {
+                            Log.d(TAG, "onAuthenticationError: " + errorCode + " - " + errString);
+                            super.onAuthenticationError(errorCode, errString);
+                            if(unlockCredentialsContext != null)
+                              unlockCredentialsContext.error("onAuthenticationError: " + errorCode + " - " + errString);
+                        }
+
+                        @Override
+                        public void onAuthenticationHelp(int helpCode, CharSequence helpString) {
+                            super.onAuthenticationHelp(helpCode, helpString);
+                        }
+
+                        @Override
+                        public void onAuthenticationSucceeded(BiometricPrompt.AuthenticationResult result) {
+                           Log.d(TAG, "onAuthenticationSucceeded " + result);
+                            super.onAuthenticationSucceeded(result);
+                            if(unlockCredentialsContext != null)
+                               unlockCredentialsContext.success();
+                        }
+
+                        @Override
+                        public void onAuthenticationFailed() {
+                            super.onAuthenticationFailed();
+                            if(unlockCredentialsContext != null)
+                              unlockCredentialsContext.error("onAuthenticationFailed");
+                        }
+                    });
                 } else {
-                    Log.e(TAG, "Error creating Confirm Credentials Intent");
-                    unlockCredentialsContext.error("Cant't unlock credentials, error creating Confirm Credentials Intent");
+                    Log.d(TAG, "KeyguardManager");
+                    KeyguardManager keyguardManager = (KeyguardManager) (getContext().getSystemService(Context.KEYGUARD_SERVICE));
+                    Intent intent = keyguardManager.createConfirmDeviceCredentialIntent(title, description);
+                    if (intent != null) {
+                        startActivity(intent);
+                    } else {
+                        Log.e(TAG, "Error creating Confirm Credentials Intent");
+                        unlockCredentialsContext.error("Cant't unlock credentials, error creating Confirm Credentials Intent");
+                    }
                 }
             }
         });
@@ -266,7 +350,7 @@ public class SecureStorage extends CordovaPlugin {
      *
      * @param userAuthenticationValidityDuration User authentication validity duration in seconds
      */
-    private void generateEncryptionKeys(Integer userAuthenticationValidityDuration) {
+    private void generateEncryptionKeys(final Integer userAuthenticationValidityDuration) {
         if (generateKeysContext != null && !generateKeysContextRunning) {
             cordova.getThreadPool().execute(new Runnable() {
                 public void run() {
@@ -274,9 +358,11 @@ public class SecureStorage extends CordovaPlugin {
                     try {
                         String alias = service2alias(INIT_SERVICE);
                         SharedPreferencesHandler storage = getStorage(INIT_SERVICE);
-                        //Solves Issue #96. The RSA key may have been deleted by changing the lock type.
-                        getStorage(INIT_SERVICE).clear();
-                        rsa.createKeyPair(getContext(), alias, userAuthenticationValidityDuration);
+                        if (storage.isEmpty()) {
+                            //Solves Issue #96. The RSA key may have been deleted by changing the lock type.
+                            getStorage(INIT_SERVICE).clear();
+                            rsa.createKeyPair(getContext(), alias, userAuthenticationValidityDuration);
+                        }
                         generateKeysContext.success();
                     } catch (Exception e) {
                         Log.e(TAG, MSG_KEYS_FAILED, e);
@@ -309,6 +395,23 @@ public class SecureStorage extends CordovaPlugin {
 
     private Context getContext() {
         return cordova.getActivity().getApplicationContext();
+    }
+
+    /**
+     * Creates a executor with handler to run runnable tasks.
+     */
+    private Executor getExecutor() {
+        return new Executor() {
+            @Override
+            public void execute(Runnable command) {
+                Log.d(TAG, "execute");
+                cordova.getActivity().runOnUiThread(() -> {
+                  Handler handler = new Handler();
+                  Log.d(TAG, "handler " + handler);
+                  handler.post(command);
+               });
+            }
+        };
     }
 
     private Context getPackageContext(String packageName) throws Exception {
